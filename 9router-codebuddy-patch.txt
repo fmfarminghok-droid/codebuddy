@@ -1,0 +1,129 @@
+﻿PATCH 9ROUTER CODEBUDDY / WORKBUDDY
+================================
+
+INSTRUKSI UNTUK AI AGENT
+Perbaiki error CodeBuddy International HTTP 400, code 11128,
+"conversation id missing". Cari executor provider dan pembentukan header
+outbound di versi 9router yang terpasang. Ikuti AGENTS.md jika tersedia.
+Periksa perubahan lokal sebelum mengedit, lalu langsung tes live.
+
+TEMUAN UTAMA
+Menambahkan X-Conversation-Request-ID saja TIDAK cukup.
+Header yang terlewat adalah X-Conversation-ID, yang berbeda dari ID turn.
+Client resmi CodeBuddy mengirim keduanya. Setelah header ini ditambahkan,
+tes live codebuddy-intl/claude-opus-4.7-1m berhasil HTTP 200 dengan balasan OK.
+
+HEADER YANG HARUS DITAMBAHKAN
+1. X-Conversation-ID
+   ID sesi percakapan yang stabil. Prioritaskan inbound X-Conversation-ID;
+   jika tidak ada, gunakan resolver session existing dari metadata/body/header.
+   Jangan gunakan satu ID global atau mengganti ID pada setiap retry.
+2. X-Conversation-Request-ID
+   Aggregation key per turn. Passthrough inbound jika tersedia, selain itu UUID
+   baru per turn. Pertahankan selama retry/fallback dalam turn tersebut.
+3. X-Conversation-Message-ID
+   UUID baru setiap pesan/request outbound, termasuk retry.
+4. X-Root-Request-ID
+   Sama dengan X-Conversation-Request-ID.
+5. X-Trace-ID
+   Passthrough inbound; fallback ke X-Conversation-Request-ID.
+6. X-B3-TraceId
+   Passthrough B3 inbound valid, atau random 16 byte sebagai 32 karakter hex.
+   Nilai inbound valid: 16/32 karakter hex, bukan all-zero. Stabil dalam turn.
+7. X-B3-SpanId
+   Random 8 byte sebagai 16 karakter hex, baru setiap request outbound.
+8. X-B3-Sampled
+   Implementasi yang dites menggunakan "1"; inbound "0" dipertahankan.
+
+DETAIL IMPLEMENTASI
+- Terapkan pada codebuddy-intl dan codebuddy-cn/WorkBuddy. Periksa nama
+  provider sebenarnya; versi lain mungkin memakai nama berbeda.
+- Tambahkan pada request ke upstream, bukan hanya response lokal.
+- Tangani nama header case-insensitively, hindari duplikat kapitalisasi.
+- Gunakan konteks per request, misalnya AsyncLocalStorage. Jangan simpan
+  current ID di mutable singleton executor: request paralel bisa tertukar.
+- Generate message ID/span ID di jalur yang berjalan untuk tiap outbound.
+- Pertahankan auth, proxy, dan payload yang sudah ada.
+- Jangan log API key/access token/refresh token.
+- Audit fallback resolver session: fallback connectionId saja dapat membuat
+  percakapan tanpa metadata sesi berbagi ID. Jangan menganggapnya selalu
+  conversation-scoped.
+
+FILE YANG DIUBAH PADA MESIN ASAL
+Instalasi global (jalankan npm root -g untuk mendapatkan GLOBAL_NPM_ROOT):
+<GLOBAL_NPM_ROOT>\9router
+
+1. app/custom-server.js
+   Tambah require("./buddy-request-context.cjs") dan panggil install().
+   Bungkus pemanggilan handler inbound dengan:
+   buddyRequestContext.run(req.headers, () => handler(req, res))
+
+2. app/buddy-request-context.cjs (file baru)
+   Helper createTurn(), addHeaders(), run(), install().
+   AsyncLocalStorage menyimpan konteks turn.
+   Hook execute() membuat konteks per eksekusi dan menetapkan conversation ID.
+   Hook buildHeaders() menambahkan delapan header di atas.
+   Conversation ID inbound diprioritaskan; fallback memakai resolver sesi
+   existing dengan headers=credentials.rawHeaders, body=options.body,
+   connectionId=credentials.connectionId, scope=provider.
+
+Mesin asal memakai npm build webpack, bukan checkout source lengkap.
+Hook install() membungkus factory generic executor sebelum webpack memuatnya:
+- app/.next-cli-build/server/chunks/318.js
+- module 96179, export L: generic executor yang diwarisi executor CodeBuddy.
+- module 80662, export oV: resolver session existing.
+
+PENTING: module ID/chunk di atas khusus build mesin asal. Jangan hardcode
+pada versi lain tanpa memeriksa. Bila source tersedia, implementasikan
+langsung di source executor/helper lalu rebuild. Update/reinstall npm bisa
+menimpa patch lokal. Dokumen ini panduan implementasi, bukan patch executable.
+
+BUKTI DARI CLIENT RESMI
+Referensi bundle client resmi (temukan lokasi instalasi CodeBuddy di mesin sendiri):
+<CODEBUDDY_INSTALL_DIR>\resources\app\extensions\genie\out\extension\index.js
+
+Konstanta ditemukan:
+CONVERSATION_ID_HEADER = "X-Conversation-ID"
+CONVERSATION_REQUEST_ID_HEADER = "X-Conversation-Request-ID"
+CONVERSATION_MESSAGE_ID_HEADER = "X-Conversation-Message-ID"
+
+Client menyebut conversation ID dipakai untuk affinity routing dan prefix
+cache reuse. Jadi conversation ID sebaiknya stabil dalam satu sesi.
+
+TES YANG HARUS DILAKUKAN AGENT
+1. Temukan instalasi, proses, dan port 9router aktif.
+2. Terapkan patch dan restart proses server yang benar.
+3. Verifikasi conversation ID stabil, turn/root ID tetap saat retry,
+   message/span ID baru tiap outbound, trace inbound diteruskan, dan request
+   paralel tidak bertukar konteks.
+4. Tes live melalui API lokal memakai API key existing tanpa mencetak key:
+
+POST http://127.0.0.1:20128/v1/chat/completions
+Authorization: Bearer <API_KEY_9ROUTER>
+Content-Type: application/json
+
+{
+  "model": "codebuddy-intl/claude-opus-4.7-1m",
+  "messages": [{"role": "user", "content": "Reply with OK."}],
+  "max_tokens": 32,
+  "stream": false
+}
+
+Sesuaikan port/model dengan instalasi.
+Jika gagal, periksa header outbound tanpa membocorkan auth. Jangan menyatakan
+sukses hanya karena header terbentuk. Laporkan HTTP dan response sebenarnya.
+Tes WorkBuddy terpisah bila koneksi tersedia.
+
+HASIL AKTUAL MESIN ASAL
+Sebelum patch: HTTP 400 / 11128 / conversation id missing.
+Setelah tujuh header turn/message/tracing: masih error yang sama.
+Setelah X-Conversation-ID ditambahkan dan restart:
+Model: codebuddy-intl/claude-opus-4.7-1m
+HTTP: 200
+Assistant: OK
+finish_reason: stop
+Response ID: 7d5df0a0-b6cc-447b-b96d-51e2ea121bab
+
+Sukses live terverifikasi untuk satu request CodeBuddy International.
+WorkBuddy/CodeBuddy CN belum dites live pada sesi ini.
+
